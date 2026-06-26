@@ -27,6 +27,10 @@ from app.dataplane.reverse.protocol.xai_console_chat import (
     ConsoleStreamAdapter,
     stream_console_chat,
 )
+from app.dataplane.reverse.protocol.tool_prompt import (
+    build_tool_system_prompt, extract_tool_names, inject_into_message,
+)
+from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
 from app.products._account_selection import reserve_account, selection_max_retries
 from app.products.openai.chat import _configured_retry_codes, _should_retry_upstream
 from ._format import (
@@ -35,6 +39,7 @@ from ._format import (
     build_resp_usage,
     format_sse,
 )
+from ._tool_sieve import ToolSieve
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -90,6 +95,9 @@ async def create(
     response_id: str,
     reasoning_id: str,
     message_id: str,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
+    tool_names: list[str] | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Console models /v1/responses handler."""
 
@@ -101,6 +109,18 @@ async def create(
 
     # reasoning effort 映射
     effort = "low" if emit_think else "none"
+
+    # Tool prompt injection for Console models
+    if tools and tool_names:
+        tool_prompt = build_tool_system_prompt(tools, tool_choice)
+        # Inject tool prompt into the last user message
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg["content"] = inject_into_message(content, tool_prompt)
+                break
+        logger.info("console responses tool injection: tool_names={} choice={}", tool_names, tool_choice)
 
     from app.dataplane.account import _directory as _acct_dir
     if _acct_dir is None:
@@ -125,6 +145,8 @@ async def create(
                 _retry = False
                 adapter = ConsoleStreamAdapter()
                 text_buf: list[str] = []
+                sieve = ToolSieve(tool_names) if tool_names else None
+                tool_calls_emitted = False
 
                 try:
                     payload = build_console_payload(
@@ -176,89 +198,147 @@ async def create(
                         async for event_type, data in stream_console_chat(
                             token, payload, timeout_s=timeout_s
                         ):
+                            if tool_calls_emitted:
+                                break
                             event_count += 1
                             tokens = adapter.feed(event_type, data)
                             for tok in tokens:
-                                text_buf.append(tok)
-                                yield format_sse("response.output_text.delta", {
-                                    "type": "response.output_text.delta",
-                                    "item_id": message_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "delta": tok,
-                                })
+                                # Feed through ToolSieve if tools are active
+                                if sieve is not None:
+                                    safe_text, calls = sieve.feed(tok)
+                                    if calls is not None:
+                                        # Tool calls detected!
+                                        from .responses import _build_fc_items, _emit_fc_events
+                                        fc_items = _build_fc_items(calls)
+                                        async for evt in _emit_fc_events(fc_items, 0):
+                                            yield evt
+                                        tool_calls_emitted = True
+                                        break
+                                    text_chunk = safe_text
+                                else:
+                                    text_chunk = tok
+
+                                if text_chunk and not tool_calls_emitted:
+                                    text_buf.append(text_chunk)
+                                    yield format_sse("response.output_text.delta", {
+                                        "type": "response.output_text.delta",
+                                        "item_id": message_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": text_chunk,
+                                    })
+                            if tool_calls_emitted:
+                                break
 
                         logger.info(
                             "console responses stream raw: events={} text_tokens={} adapter_text_len={}",
                             event_count, len(text_buf), len(adapter.full_text),
                         )
 
+                        # Flush sieve after stream ends (incomplete XML at end of stream)
+                        if sieve is not None and not tool_calls_emitted:
+                            calls = sieve.flush()
+                            if calls:
+                                from .responses import _build_fc_items, _emit_fc_events
+                                fc_items = _build_fc_items(calls)
+                                async for evt in _emit_fc_events(fc_items, 0):
+                                    yield evt
+                                tool_calls_emitted = True
+
                         # 流结束
                         full_text = "".join(text_buf)
 
-                        # output_text.done
-                        yield format_sse("response.output_text.done", {
-                            "type": "response.output_text.done",
-                            "item_id": message_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": full_text,
-                        })
+                        if tool_calls_emitted:
+                            # Build output with function_call items only
+                            from .responses import _build_fc_items as _build_fc
+                            usage_data = adapter.usage
+                            input_tokens = (
+                                usage_data.get("input_tokens", 0) if usage_data
+                                else estimate_prompt_tokens(messages)
+                            )
+                            output_tokens = 0  # tool calls don't have text output tokens
+                            output_items = fc_items
+                            yield format_sse("response.completed", {
+                                "type": "response.completed",
+                                "response": make_resp_object(
+                                    response_id, model, "completed", output_items,
+                                    usage=build_resp_usage(input_tokens, output_tokens),
+                                ),
+                            })
+                            yield "data: [DONE]\n\n"
+                            success = True
+                            logger.info(
+                                "console responses stream tool_calls: model={} calls={}",
+                                model, len(fc_items),
+                            )
+                        else:
+                            # Normal text path
+                            # output_text.done
+                            yield format_sse("response.output_text.done", {
+                                "type": "response.output_text.done",
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": full_text,
+                            })
 
-                        # content_part.done
-                        yield format_sse("response.content_part.done", {
-                            "type": "response.content_part.done",
-                            "item_id": message_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": full_text, "annotations": []},
-                        })
+                            # content_part.done
+                            yield format_sse("response.content_part.done", {
+                                "type": "response.content_part.done",
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": {"type": "output_text", "text": full_text, "annotations": []},
+                            })
 
-                        # output_item.done
-                        yield format_sse("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": 0,
-                            "item": {
+                            # output_item.done
+                            yield format_sse("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {
+                                    "id": message_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "completed",
+                                    "content": [{"type": "output_text", "text": full_text}],
+                                },
+                            })
+
+                        if not tool_calls_emitted:
+                            # usage
+                            usage_data = adapter.usage
+                            input_tokens = (
+                                usage_data.get("input_tokens", 0) if usage_data
+                                else estimate_prompt_tokens(messages)
+                            )
+                            output_tokens = (
+                                usage_data.get("output_tokens", 0) if usage_data
+                                else estimate_tokens(full_text)
+                            )
+
+                            # response.completed
+                            output_items = [{
                                 "id": message_id,
                                 "type": "message",
                                 "role": "assistant",
                                 "status": "completed",
                                 "content": [{"type": "output_text", "text": full_text}],
-                            },
-                        })
-
-                        # usage
-                        usage_data = adapter.usage
-                        input_tokens = (
-                            usage_data.get("input_tokens", 0) if usage_data
-                            else estimate_prompt_tokens(messages)
-                        )
-                        output_tokens = (
-                            usage_data.get("output_tokens", 0) if usage_data
-                            else estimate_tokens(full_text)
-                        )
-
-                        # response.completed
-                        output_items = [{
-                            "id": message_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": full_text}],
-                        }]
-                        yield format_sse("response.completed", {
-                            "type": "response.completed",
-                            "response": make_resp_object(
-                                response_id, model, "completed", output_items,
-                                usage=build_resp_usage(input_tokens, output_tokens),
-                            ),
-                        })
-                        yield "data: [DONE]\n\n"
-                        success = True
-                        logger.info(
-                            "console responses stream completed: model={} text_len={} attempt={}/{}",
-                            model, len(full_text), attempt + 1, max_retries + 1,
-                        )
+                            }]
+                            yield format_sse("response.completed", {
+                                "type": "response.completed",
+                                "response": make_resp_object(
+                                    response_id, model, "completed", output_items,
+                                    usage=build_resp_usage(input_tokens, output_tokens),
+                                ),
+                            })
+                            yield "data: [DONE]\n\n"
+                            success = True
+                            logger.info(
+                                "console responses stream completed: model={} text_len={} attempt={}/{}",
+                                model, len(full_text), attempt + 1, max_retries + 1,
+                            )
+                        else:
+                            success = True
 
                     except UpstreamError as exc:
                         fail_exc = exc
