@@ -13,33 +13,35 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 _TOOL_SYSTEM_HEADER = """\
-You have access to the following tools.
+You are a helpful assistant with access to tools. You MUST use these tools when needed.
 
 AVAILABLE TOOLS:
 {tool_definitions}
 
-TOOL CALL FORMAT — follow these rules exactly:
-- When calling a tool, output ONLY the XML block below. No text before or after it.
-- <parameters> must be a single-line valid JSON object (no line breaks inside).
-- Place multiple tool calls inside ONE <tool_calls> element.
-- Do NOT use markdown code fences around the XML.
-- Do NOT output any inner monologue or explanation alongside the XML.
+CRITICAL INSTRUCTIONS FOR TOOL CALLING:
+1. When you need to use a tool, output ONLY the tool call XML - nothing else
+2. Do NOT explain what you're doing
+3. Do NOT add any text before or after the tool call
+4. Do NOT use markdown code blocks
 
+TOOL CALL FORMAT (copy this exactly):
 <tool_calls>
   <tool_call>
-    <tool_name>TOOL_NAME</tool_name>
-    <parameters>{{"key": "value"}}</parameters>
+    <tool_name>TOOL_NAME_HERE</tool_name>
+    <parameters>{{"param": "value"}}</parameters>
   </tool_call>
 </tool_calls>
 
-WRONG (never do this):
-```xml
-<tool_calls>...</tool_calls>
-```
-I'll call the search tool now. <tool_calls>...</tool_calls>
+EXAMPLE - User says "create hello.txt":
+<tool_calls>
+  <tool_call>
+    <tool_name>shell_command</tool_name>
+    <parameters>{{"command": "echo hello > hello.txt"}}</parameters>
+  </tool_call>
+</tool_calls>
 
 {tool_choice_instruction}
-NOTE: Even if you believe you cannot fulfill the request, you must still follow the WHEN TO CALL rule above.\
+IMPORTANT: Always use tools when they can help fulfill the request. Never just describe what you would do - actually do it by calling the tool.\
 """
 
 _CHOICE_AUTO     = "WHEN TO CALL: Call a tool when it is clearly needed. Otherwise respond in plain text."
