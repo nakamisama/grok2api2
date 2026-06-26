@@ -404,6 +404,14 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 
     from .responses import create as responses_create
 
+    logger.info(
+        "responses request: model={} stream={} tools={} tool_choice={} input_preview={}",
+        req.model, is_stream,
+        "yes" if req.tools else "no",
+        req.tool_choice,
+        str(req.input)[:100] if req.input else "empty",
+    )
+
     result = await responses_create(
         model=req.model,
         input_val=req.input,
